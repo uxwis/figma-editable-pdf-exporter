@@ -1,0 +1,61 @@
+:root {
+  color: var(--figma-color-text, #171717);
+  background: var(--figma-color-bg, #ffffff);
+  font-family: Inter, "Microsoft YaHei UI", system-ui, sans-serif;
+  font-size: 12px;
+  font-synthesis: none;
+}
+
+* { box-sizing: border-box; }
+body { margin: 0; min-width: 360px; }
+button { color: inherit; font: inherit; }
+
+.app-shell { padding: 16px 18px; }
+
+.summary-card, .section, .progress-card, .export-card {
+  border: 1px solid var(--figma-color-border, #e5e7eb); border-radius: 12px;
+  background: var(--figma-color-bg-secondary, #fafafa); margin-bottom: 12px;
+}
+.summary-card { padding: 12px; display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 12px; align-items: center; }
+.summary-card > div:first-child { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+.summary-card strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.eyebrow { color: var(--figma-color-text-tertiary, #858585); font-size: 10px; text-transform: uppercase; letter-spacing: .08em; }
+
+.section { padding: 12px; }
+.section-title { display: flex; align-items: center; justify-content: space-between; gap: 12px; font-weight: 700; margin-bottom: 10px; }
+.ghost-button, .secondary-button, .primary-button, .danger-button {
+  border: 0; border-radius: 7px; cursor: pointer; transition: opacity .15s, transform .15s;
+}
+.ghost-button { justify-self: end; padding: 6px 9px; border: 1px solid var(--figma-color-border, #ddd); background: var(--figma-color-bg, #fff); }
+.secondary-button { padding: 8px 10px; border: 1px solid var(--figma-color-border, #d1d5db); background: var(--figma-color-bg, #fff); font-weight: 600; }
+.primary-button { flex: 0 0 auto; padding: 9px 15px; background: var(--figma-color-bg-brand, #4f46e5); color: var(--figma-color-text-onbrand, #fff); font-weight: 700; }
+.danger-button { flex: 0 0 auto; padding: 9px 15px; background: #fee2e2; color: #b91c1c; font-weight: 700; }
+button:disabled { opacity: .42; cursor: not-allowed; }
+button:not(:disabled):active { transform: translateY(1px); }
+
+.warning-panel ul { margin: 0; padding-left: 18px; max-height: 128px; overflow: auto; }
+.warning-panel li { margin: 5px 0; line-height: 1.45; color: #a16207; }
+.warning-panel li.error { color: #b91c1c; }
+.warning-panel > small { display: block; margin-top: 8px; color: var(--figma-color-text-tertiary, #777); }
+
+.progress-card { padding: 11px 12px; }
+.progress-card span { display: block; margin-top: 7px; color: var(--figma-color-text-secondary, #666); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.progress-bar { height: 5px; border-radius: 99px; background: var(--figma-color-bg-tertiary, #e5e7eb); overflow: hidden; }
+.progress-bar i { display: block; height: 100%; border-radius: inherit; background: linear-gradient(90deg, #7c3aed, #2563eb); transition: width .25s; }
+.result-note { margin: 2px 1px 12px; color: #a16207; font-size: 11px; }
+
+.export-card {
+  display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 14px;
+  padding: 12px; margin-bottom: 0;
+  background: color-mix(in srgb, var(--figma-color-bg-brand, #4f46e5) 5%, var(--figma-color-bg, #fff));
+}
+.export-copy { display: flex; min-width: 0; flex-direction: column; gap: 3px; }
+.export-copy strong { font-size: 11px; line-height: 1.35; overflow-wrap: anywhere; }
+.export-copy span { color: var(--figma-color-text-secondary, #666); font-size: 10px; }
+.export-actions { display: flex; align-items: center; gap: 7px; }
+
+@media (prefers-color-scheme: dark) {
+  .warning-panel li, .result-note { color: #facc15; }
+  .warning-panel li.error { color: #fca5a5; }
+  .danger-button { background: #450a0a; color: #fecaca; }
+}
