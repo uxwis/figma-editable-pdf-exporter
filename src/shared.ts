@@ -115,12 +115,14 @@ export type UiToPluginMessage =
   | { type: 'rescan' }
   | { type: 'scan'; requestId: number }
   | { type: 'export-page'; pageId: string; frameId: string; pageNumber: number; totalPages: number }
+  | { type: 'text-analysis'; requestId: number; editableTextKeys: string[] }
   | { type: 'cancel' }
   | { type: 'resize'; width: number; height: number }
 
 export type PluginToUiMessage =
   | { type: 'scan-result'; result: ScanResult; requestId?: number }
   | { type: 'page-assets'; assets: PageExportAssets }
+  | { type: 'analyze-text'; requestId: number; svg: string; textNodes: TextNodeMeta[] }
   | { type: 'progress'; progress: ExportProgress }
   | { type: 'cancelled' }
   | { type: 'error'; code: ExportErrorCode; message: string; requestId?: number }
@@ -128,17 +130,34 @@ export type PluginToUiMessage =
 export interface SortableFrame {
   x: number
   y: number
-  name?: string
+  height: number
 }
 
 export function sortFrames<T extends SortableFrame>(frames: readonly T[]): T[] {
-  return [...frames].sort((left, right) => {
-    const byY = left.y - right.y
-    if (Math.abs(byY) > 0.01) return byY
-    const byX = left.x - right.x
-    if (Math.abs(byX) > 0.01) return byX
-    return (left.name ?? '').localeCompare(right.name ?? '')
-  })
+  function compare(left: T, right: T): number {
+    // Vertically separate frames read top to bottom; intersecting vertical
+    // spans read left to right. Use full frame heights, not a pixel tolerance.
+    const overlap = Math.min(left.y + left.height, right.y + right.height)
+      - Math.max(left.y, right.y)
+    return overlap > 0
+      ? left.x - right.x || left.y - right.y
+      : left.y - right.y || left.x - right.x
+  }
+
+  // The Page 8 native PDF reference includes staggered, overlapping spans.
+  // Such comparisons need not be transitive. Use a fixed, stable insertion
+  // pass over page.children instead of relying on engine-specific Array.sort
+  // behavior or pre-sorting into artificial rows. Names never affect order.
+  const ordered: T[] = []
+  for (const frame of frames) {
+    let index = ordered.length
+    while (index > 0 && compare(frame, ordered[index - 1]) < 0) {
+      ordered[index] = ordered[index - 1]
+      index -= 1
+    }
+    ordered[index] = frame
+  }
+  return ordered
 }
 
 export function makeFontKey(family: string, style: string): string {

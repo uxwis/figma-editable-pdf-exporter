@@ -158,6 +158,9 @@ export async function generateEditablePdf(
     const [copiedPage] = await output.copyPages(background, [0])
     const page = output.addPage(copiedPage)
     const parsed = parseSvgText(sourcePage.svg, sourcePage.textNodes)
+    if (parsed.outlinedTextKeys.length > 0) {
+      throw new UserFacingError('UNSUPPORTED_CONTENT', `画板「${sourcePage.frameName}」存在未完成转曲的文字，请重新导出。`)
+    }
     warnings.push(...sourcePage.warnings, ...parsed.warnings)
     const pageFontResources = new Map<string, PDFName>()
     const cursors = new Map<string, { x: number; y: number }>()

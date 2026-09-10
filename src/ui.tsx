@@ -15,8 +15,21 @@ import {
 } from './shared'
 import { buildDeliveryZip } from './export/package'
 import { createEditablePdfArtifact } from './export/workflow'
+import { parseSvgText } from './export/svg-text'
 
 type ExportMode = 'pdf' | 'zip'
+
+function Icon({ name }: { name: 'refresh' | 'download' }) {
+  const paths = {
+    refresh: 'M13 6A5.2 5.2 0 1 0 13 10M13 2v4H9',
+    download: 'M8 2v8m-3-3 3 3 3-3M3 11v3h10v-3',
+  }
+  return (
+    <svg className="icon" width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+      <path d={paths[name]} stroke="currentColor" strokeWidth="1.25" strokeLinecap="round" strokeLinejoin="round" />
+    </svg>
+  )
+}
 
 function send(message: UiToPluginMessage): void {
   parent.postMessage({ pluginMessage: message }, '*')
@@ -49,6 +62,7 @@ function progressText(progress: ExportProgress | null): string {
 function App() {
   const appRef = useRef<HTMLElement>(null)
   const [scan, setScan] = useState<ScanResult | null>(null)
+  const [scanning, setScanning] = useState(true)
   const [exporting, setExporting] = useState(false)
   const [progress, setProgress] = useState<ExportProgress | null>(null)
   const [status, setStatus] = useState('正在读取当前 Figma 页面…')
@@ -73,7 +87,7 @@ function App() {
     const resize = () => {
       cancelAnimationFrame(frame)
       frame = requestAnimationFrame(() => {
-        const height = Math.max(260, Math.min(600, Math.ceil(app.scrollHeight)))
+        const height = Math.max(180, Math.min(600, Math.ceil(app.scrollHeight)))
         if (Math.abs(height - lastHeight) < 2) return
         lastHeight = height
         send({ type: 'resize', width: 420, height })
@@ -94,8 +108,22 @@ function App() {
     const onMessage = (event: MessageEvent<{ pluginMessage?: PluginToUiMessage }>) => {
       const message = event.data.pluginMessage
       if (!message) return
+      if (message.type === 'analyze-text') {
+        let editableTextKeys: string[] = []
+        try {
+          const parsed = parseSvgText(message.svg, message.textNodes)
+          const outlined = new Set(parsed.outlinedTextKeys)
+          editableTextKeys = message.textNodes.filter((meta) => !outlined.has(meta.key)).map((meta) => meta.key)
+        } catch (error) {
+          console.warn('[Editable PDF Exporter] Preserving native text after SVG analysis failed', error)
+        }
+        send({ type: 'text-analysis', requestId: message.requestId, editableTextKeys })
+        return
+      }
       if (message.type === 'scan-result') {
         setScan(message.result)
+        setScanning(false)
+        setLastWarnings([])
         const request = pendingScan.current
         if (request && message.requestId === request.requestId) {
           request.resolve(message.result)
@@ -103,9 +131,10 @@ function App() {
           return
         }
         setStatus(
-          message.result.frames.length
+          message.result.warnings.find((warning) => warning.severity === 'error')?.message
+          ?? (message.result.frames.length
             ? '已准备好，可以直接导出。'
-            : '当前页面没有顶层 Frame。',
+            : '当前页面没有顶层 Frame。'),
         )
         return
       }
@@ -124,6 +153,7 @@ function App() {
         return
       }
       if (message.type === 'error') {
+        setScanning(false)
         const error = new UserFacingError(message.code, message.message)
         const request = pendingScan.current
         if (request && message.requestId === request.requestId) {
@@ -146,8 +176,15 @@ function App() {
     scan
       && scan.frames.length > 0
       && !blockingScanError
+      && !scanning
       && !exporting,
   )
+
+  function rescan(): void {
+    setScanning(true)
+    setStatus('正在刷新当前页面…')
+    send({ type: 'rescan' })
+  }
 
   function requestFreshScan(): Promise<ScanResult> {
     return new Promise((resolve, reject) => {
@@ -239,19 +276,21 @@ function App() {
 
   return (
     <main ref={appRef} className="app-shell">
-      <section className="summary-card">
-        <div>
-          <span className="eyebrow">当前页面</span>
-          <strong>{scan?.pageName ?? '读取中…'}</strong>
+      <header className="page-header">
+        <div className="page-copy">
+          <span className="muted-label">当前页面</span>
+          <strong title={scan?.pageName}>{scan?.pageName ?? '读取中…'}</strong>
+          <span className="muted-label">{scan ? `${scan.frames.length} 个画板 · ${scan.fonts.length} 种字体样式` : '正在扫描…'}</span>
         </div>
-        <button className="ghost-button" type="button" disabled={exporting} onClick={() => send({ type: 'rescan' })}>
-          重新扫描
+        <button className="ghost-button" type="button" title="重新读取当前页面" disabled={exporting || scanning} onClick={rescan}>
+          <Icon name="refresh" />
+          {scanning ? '读取中' : '刷新'}
         </button>
-      </section>
+      </header>
 
       {scan && scan.warnings.length > 0 && (
-        <section className="section warning-panel">
-          <div className="section-title"><span>导出前检查</span></div>
+        <section className="warning-panel" aria-labelledby="warning-title">
+          <div className="section-title"><h2 id="warning-title">导出前检查</h2><span className="muted-label">{scan.warnings.length} 项提示</span></div>
           <ul>
             {scan.warnings.slice(0, 8).map((warning, index) => (
               <li className={warning.severity} key={`${warning.code}-${index}`}>{warning.message}</li>
@@ -262,23 +301,24 @@ function App() {
       )}
 
       {exporting && (
-        <section className="progress-card">
-          <div className="progress-bar"><i style={{ width: progress ? `${(progress.pageNumber / progress.totalPages) * 100}%` : '4%' }} /></div>
-          <span>{progressText(progress)}</span>
+        <section className="progress-section">
+          <div className="progress-bar" role="progressbar" aria-label="导出进度" aria-valuemin={0} aria-valuemax={scan?.frames.length ?? 1} aria-valuenow={progress?.pageNumber ?? 0}>
+            <i style={{ width: progress ? `${(progress.pageNumber / progress.totalPages) * 100}%` : '4%' }} />
+          </div>
+          <span title={progressText(progress)}>{progressText(progress)}</span>
         </section>
       )}
 
       {lastWarnings.length > 0 && !exporting && (
-        <div className="result-note">检测到 {lastWarnings.length} 条兼容性提示。</div>
+        <div className="result-note">
+          {lastWarnings.some((warning) => warning.code.startsWith('TEXT_OUTLINED'))
+            ? '部分文字已自动转曲保留外观，其余文字保持可编辑。'
+            : `检测到 ${lastWarnings.length} 条兼容性提示。`}
+        </div>
       )}
 
-      <section className="export-card">
-        <div className="export-copy">
-          <strong>{status}</strong>
-          <span>
-            {scan ? `${scan.frames.length} 个画板 · ${scan.fonts.length} 种字体样式` : '正在扫描页面'}
-          </span>
-        </div>
+      <footer className="export-footer">
+        <p className="status-text" role="status">{status}</p>
         {exporting ? (
           <button className="danger-button" type="button" onClick={cancelExport}>取消导出</button>
         ) : (
@@ -293,11 +333,12 @@ function App() {
               交接包
             </button>
             <button className="primary-button" type="button" disabled={!canExport} onClick={() => void startExport('pdf')}>
+              <Icon name="download" />
               导出 PDF
             </button>
           </div>
         )}
-      </section>
+      </footer>
     </main>
   )
 }

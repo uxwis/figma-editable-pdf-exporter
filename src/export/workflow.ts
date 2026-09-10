@@ -1,4 +1,4 @@
-import { EXPORT_CANCELLED, type ExportWarning, type PageExportAssets, type ScanResult } from '../shared'
+import { EXPORT_CANCELLED, splitFontKey, uniqueCharacters, type ExportWarning, type FontRequirement, type PageExportAssets, type ScanResult } from '../shared'
 import type { FontMapping } from './font'
 import { generateEditablePdf } from './pdf'
 import { resolveFonts } from './resolve-fonts'
@@ -31,14 +31,36 @@ export async function createEditablePdfArtifact(
 ): Promise<EditablePdfArtifact> {
   const { scan, requestPage, isCancelled, setStatus } = options
   if (isCancelled()) throw new Error(EXPORT_CANCELLED)
-  setStatus('正在自动准备可编辑文字…')
-  const fonts = await resolveFonts(scan.fonts)
+  setStatus('正在提取文字并检查转曲回退…')
 
   const pages: PageExportAssets[] = []
   for (const frame of scan.frames) {
     if (isCancelled()) throw new Error(EXPORT_CANCELLED)
     pages.push(await requestPage(frame.id, frame.pageNumber, scan.frames.length))
   }
+  if (isCancelled()) throw new Error(EXPORT_CANCELLED)
+
+  // Outlined text needs no PDF font. Use the confirmed page assets so font
+  // manifests also reflect text/font changes since the initial scan.
+  const requirements = new Map<string, FontRequirement>()
+  for (const page of pages) {
+    for (const meta of page.textNodes) {
+      for (const segment of meta.segments) {
+        const requirement = requirements.get(segment.fontKey) ?? {
+          key: segment.fontKey,
+          ...splitFontKey(segment.fontKey),
+          characters: '',
+          pages: [],
+          hasMissingFont: false,
+        }
+        requirement.characters = uniqueCharacters(requirement.characters + segment.characters)
+        if (!requirement.pages.includes(page.pageNumber)) requirement.pages.push(page.pageNumber)
+        requirements.set(segment.fontKey, requirement)
+      }
+    }
+  }
+  setStatus('正在自动准备可编辑文字…')
+  const fonts = await resolveFonts([...requirements.values()])
   if (isCancelled()) throw new Error(EXPORT_CANCELLED)
 
   setStatus('正在写入可编辑文字并合并 PDF…')

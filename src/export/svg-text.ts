@@ -1,5 +1,5 @@
 import { UserFacingError, type ExportWarning, type TextNodeMeta } from '../shared'
-import { cumulativeTransform, IDENTITY_MATRIX, type Matrix } from './matrix'
+import { cumulativeTransform, type Matrix } from './matrix'
 
 export interface RgbColor {
   r: number
@@ -36,6 +36,7 @@ export interface SvgTextRun {
 export interface ParsedSvgText {
   viewBox: SvgViewBox
   runs: SvgTextRun[]
+  outlinedTextKeys: string[]
   warnings: ExportWarning[]
 }
 
@@ -196,123 +197,113 @@ function findNodeContainer(root: SVGSVGElement, key: string): Element | null {
   return Array.from(root.querySelectorAll('[id]')).find((element) => element.id === key) ?? null
 }
 
-function pathFallbackRun(meta: TextNodeMeta, container: Element | null, root: SVGSVGElement): SvgTextRun | null {
-  const segment = meta.segments[0]
-  if (!segment || !meta.characters) return null
-  const styleElement = container?.querySelector('text') ?? container
-  const fill = parseColor(styleElement ? inheritedStyle(styleElement, 'fill', root) : null, root) ?? {
-    r: 0,
-    g: 0,
-    b: 0,
-    a: 1,
+function hasUnsupportedSvgStyle(leaf: Element, root: SVGSVGElement): boolean {
+  for (const property of ['fill', 'stroke', 'filter', 'mask']) {
+    const value = inheritedStyle(leaf, property, root)?.trim()
+    if (!value || value === 'none') continue
+    if (property !== 'fill' || value.startsWith('url(')) return true
   }
-  const radians = (-meta.fallback.rotation * Math.PI) / 180
-  return {
-    nodeKey: meta.key,
-    text: meta.characters,
-    fontKey: segment.fontKey,
-    fontSize: segment.fontSize,
-    x: meta.fallback.x,
-    y: meta.fallback.y + segment.fontSize,
-    dx: 0,
-    dy: 0,
-    letterSpacing: 0,
-    transform: {
-      a: Math.cos(radians),
-      b: Math.sin(radians),
-      c: -Math.sin(radians),
-      d: Math.cos(radians),
-      e: 0,
-      f: 0,
-    },
-    fill,
-    stroke: null,
-    strokeWidth: 0,
-    opacity: 1,
-    textAnchor: 'start',
+  for (const property of ['rotate', 'textLength', 'lengthAdjust', 'writing-mode', 'text-decoration']) {
+    const value = inheritedStyle(leaf, property, root)
+    if (value && value !== 'none' && value !== '0' && value !== 'horizontal-tb') return true
   }
+  // PDF cursor positioning cannot reproduce per-glyph SVG coordinate lists.
+  for (const property of ['x', 'y', 'dx', 'dy']) {
+    const value = inheritedStyle(leaf, property, root)?.trim()
+    if (value && value.split(/[\s,]+/).length > 1) return true
+  }
+  return false
+}
+
+function withoutWhitespace(text: string): string {
+  return text.replace(/\s/g, '')
 }
 
 export function parseSvgText(svg: string, textNodes: TextNodeMeta[]): ParsedSvgText {
   const document = new DOMParser().parseFromString(svg, 'image/svg+xml')
-  const parserError = document.querySelector('parsererror')
-  if (parserError) throw new UserFacingError('SVG_PARSE', 'Figma 文字定位数据无法解析，请重新扫描后重试。')
+  if (document.querySelector('parsererror')) {
+    throw new UserFacingError('SVG_PARSE', 'Figma 文字定位数据无法解析，请重新扫描后重试。')
+  }
   const root = document.documentElement as unknown as SVGSVGElement
   const runs: SvgTextRun[] = []
   const warnings: ExportWarning[] = []
+  const outlinedTextKeys: string[] = []
+
+  function outline(meta: TextNodeMeta): void {
+    outlinedTextKeys.push(meta.key)
+    warnings.push({
+      code: 'TEXT_OUTLINED_SVG',
+      severity: 'warning',
+      nodeKey: meta.key,
+      message: `文字层 ${meta.key} 无法可靠重建，将保留 Figma 原生转曲结果。`,
+    })
+  }
 
   for (const meta of textNodes) {
+    if (!withoutWhitespace(meta.characters)) continue
     const container = findNodeContainer(root, meta.key)
-    if (meta.nodeType === 'TEXT_PATH') {
-      const fallback = pathFallbackRun(meta, container, root)
-      if (fallback) runs.push(fallback)
+    if (!container || meta.nodeType === 'TEXT_PATH'
+      || !['g', 'text'].includes(container.tagName.toLowerCase())
+      || container.querySelector('path, use, image, textPath, foreignObject')) {
+      outline(meta)
       continue
     }
-    if (!container) continue
-    let textOffset = 0
     const leaves = textLeaves(container)
+    if (leaves.length === 0
+      || withoutWhitespace(leaves.map((leaf) => leaf.textContent ?? '').join('')) !== withoutWhitespace(meta.characters)) {
+      outline(meta)
+      continue
+    }
+
+    // Validate the entire node before adding any runs. Partial reconstruction
+    // must not cause missing glyphs or duplicate text over native outlines.
+    const nodeRuns: SvgTextRun[] = []
+    let textOffset = 0
+    let unsupported = false
     for (const leaf of leaves) {
       const text = leaf.textContent ?? ''
       if (!text) continue
-      const segment = segmentForOffset(meta, textOffset)
-      if (!segment) continue
+      const start = meta.characters.indexOf(text, textOffset)
+      const segment = segmentForOffset(meta, start)
+      if (start < 0 || withoutWhitespace(meta.characters.slice(textOffset, start))
+        || !segment || hasUnsupportedSvgStyle(leaf, root)
+        || meta.segments.some((other) => other.start < start + text.length && other.end > start
+          && (other.fontKey !== segment.fontKey || other.fontSize !== segment.fontSize))) {
+        unsupported = true
+        break
+      }
       const fontSize = parseLength(inheritedStyle(leaf, 'font-size', root), segment.fontSize, segment.fontSize)
       const fillOpacity = Number.parseFloat(inheritedStyle(leaf, 'fill-opacity', root) ?? '1')
-      const strokeOpacity = Number.parseFloat(inheritedStyle(leaf, 'stroke-opacity', root) ?? '1')
       const fill = parseColor(inheritedStyle(leaf, 'fill', root) ?? '#000000', root)
-      const stroke = parseColor(inheritedStyle(leaf, 'stroke', root), root)
-      if (fill) fill.a *= Number.isFinite(fillOpacity) ? clamp(fillOpacity) : 1
-      if (stroke) stroke.a *= Number.isFinite(strokeOpacity) ? clamp(strokeOpacity) : 1
+      if (!fill || fontSize <= 0) {
+        unsupported = true
+        break
+      }
+      fill.a *= Number.isFinite(fillOpacity) ? clamp(fillOpacity) : 1
       const anchorValue = inheritedStyle(leaf, 'text-anchor', root)
       const textAnchor = anchorValue === 'middle' || anchorValue === 'end' ? anchorValue : 'start'
-      runs.push({
+      nodeRuns.push({
         nodeKey: meta.key,
         text,
         fontKey: segment.fontKey,
         fontSize,
-        x: firstNumber(leaf.getAttribute('x')) ?? firstNumber(container.getAttribute('x')),
-        y: firstNumber(leaf.getAttribute('y')) ?? firstNumber(container.getAttribute('y')),
+        x: firstNumber(inheritedStyle(leaf, 'x', container)),
+        y: firstNumber(inheritedStyle(leaf, 'y', container)),
         dx: parseLength(leaf.getAttribute('dx'), fontSize),
         dy: parseLength(leaf.getAttribute('dy'), fontSize),
         letterSpacing: parseLength(inheritedStyle(leaf, 'letter-spacing', root), fontSize),
         transform: cumulativeTransform(leaf, root),
         fill,
-        stroke,
-        strokeWidth: parseLength(inheritedStyle(leaf, 'stroke-width', root), fontSize),
+        stroke: null,
+        strokeWidth: 0,
         opacity: cumulativeOpacity(leaf, root),
         textAnchor,
       })
-      textOffset += text.length
+      textOffset = start + text.length
     }
-    if (leaves.length === 0 && meta.characters) {
-      warnings.push({
-        code: 'SVG_TEXT_FALLBACK',
-        severity: 'warning',
-        nodeKey: meta.key,
-        message: `文字层 ${meta.key} 未产生标准 SVG 文本，将使用边界框简化定位。`,
-      })
-      const segment = meta.segments[0]
-      if (segment) {
-        runs.push({
-          nodeKey: meta.key,
-          text: meta.characters,
-          fontKey: segment.fontKey,
-          fontSize: segment.fontSize,
-          x: meta.fallback.x,
-          y: meta.fallback.y + segment.fontSize,
-          dx: 0,
-          dy: 0,
-          letterSpacing: 0,
-          transform: { ...IDENTITY_MATRIX },
-          fill: { r: 0, g: 0, b: 0, a: 1 },
-          stroke: null,
-          strokeWidth: 0,
-          opacity: 1,
-          textAnchor: 'start',
-        })
-      }
-    }
+    if (unsupported || nodeRuns.length === 0) outline(meta)
+    else runs.push(...nodeRuns)
   }
 
-  return { viewBox: parseViewBox(root), runs, warnings }
+  return { viewBox: parseViewBox(root), runs, outlinedTextKeys, warnings }
 }

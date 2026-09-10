@@ -15,11 +15,17 @@ import {
   type TextStyleSegmentMeta,
   type UiToPluginMessage,
 } from './shared'
+import { textOutlineReason } from './text-compatibility'
 
-figma.showUI(__html__, { width: 420, height: 320, themeColors: true })
+figma.showUI(__html__, { width: 420, height: 180, themeColors: true })
 
 let cancelled = false
 const temporaryNodes = new Set<SceneNode>()
+let nextTextAnalysisId = 1
+const pendingTextAnalyses = new Map<number, {
+  resolve(keys: string[]): void
+  reject(error: Error): void
+}>()
 
 type SupportedTextNode = TextNode | TextPathNode
 
@@ -46,62 +52,20 @@ function sortedTopLevelFrames(page: PageNode): FrameNode[] {
   )
 }
 
-function paintIsSimpleSolid(paints: readonly Paint[] | PluginAPI['mixed']): boolean {
-  if (paints === figma.mixed) return false
-  const visible = paints.filter((paint) => paint.visible !== false)
-  return visible.length <= 1 && visible.every((paint) => paint.type === 'SOLID')
-}
-
 function collectNodeWarnings(
   node: SupportedTextNode,
   frame: FrameNode,
   pageNumber: number,
 ): ExportWarning[] {
-  const warnings: ExportWarning[] = []
   const prefix = `第 ${pageNumber} 页「${frame.name}」`
-  const base = { frameId: frame.id, frameName: frame.name }
-
-  if (node.type === 'TEXT_PATH') {
-    warnings.push({
-      ...base,
-      code: 'TEXT_PATH_SIMPLIFIED',
-      severity: 'warning',
-      message: `${prefix}包含路径文字；将改为边界框内的普通横排文字。`,
-    })
-  }
-  if (!paintIsSimpleSolid(node.fills)) {
-    warnings.push({
-      ...base,
-      code: 'TEXT_FILL_SIMPLIFIED',
-      severity: 'warning',
-      message: `${prefix}包含渐变、图片或混合文字填充；将使用首个有效颜色。`,
-    })
-  }
-  if (node.effects.some((effect) => effect.visible !== false)) {
-    warnings.push({
-      ...base,
-      code: 'TEXT_EFFECTS_REMOVED',
-      severity: 'warning',
-      message: `${prefix}包含文字阴影或模糊；这些效果将被移除。`,
-    })
-  }
-  if (node.blendMode !== 'NORMAL' && node.blendMode !== 'PASS_THROUGH') {
-    warnings.push({
-      ...base,
-      code: 'TEXT_BLEND_NORMALIZED',
-      severity: 'warning',
-      message: `${prefix}包含非 Normal 文字混合模式；将按 Normal 输出。`,
-    })
-  }
-  if (node.hasMissingFont) {
-    warnings.push({
-      ...base,
-      code: 'FIGMA_FONT_MISSING',
-      severity: 'error',
-      message: `${prefix}存在 Figma 缺失字体，需先在 Figma 中恢复字体。`,
-    })
-  }
-  return warnings
+  const reason = textOutlineReason(node, frame)
+  return reason ? [{
+    frameId: frame.id,
+    frameName: frame.name,
+    code: 'TEXT_OUTLINED_STYLE',
+    severity: 'warning',
+    message: `${prefix}包含${reason}；将自动转曲保留外观，该部分不再作为可编辑文字。`,
+  }] : []
 }
 
 function fontStyleName(fontName: FontName): string {
@@ -156,6 +120,7 @@ function buildScanResult(page: PageNode): ScanResult {
 
     for (const textNode of textNodes) {
       warnings.push(...collectNodeWarnings(textNode, frame, pageNumber))
+      if (textOutlineReason(textNode, frame)) continue
       for (const segment of getTextSegments(textNode)) {
         const family = segment.fontKey.split('\u0000')[0]
         const style = segment.fontKey.split('\u0000')[1] || 'Regular'
@@ -240,6 +205,31 @@ function removeAllTemporaryNodes(): void {
   temporaryNodes.clear()
 }
 
+function cancelTextAnalyses(): void {
+  for (const pending of pendingTextAnalyses.values()) pending.reject(new Error(EXPORT_CANCELLED))
+}
+
+function requestEditableTextKeys(svg: string, textNodes: TextNodeMeta[]): Promise<Set<string>> {
+  if (textNodes.length === 0) return Promise.resolve(new Set())
+  return new Promise((resolve, reject) => {
+    const requestId = nextTextAnalysisId++
+    const finish = () => {
+      clearTimeout(timeout)
+      pendingTextAnalyses.delete(requestId)
+    }
+    // If analysis cannot complete, preserve native text instead of hiding it.
+    const timeout = setTimeout(() => {
+      finish()
+      resolve(new Set())
+    }, 30_000)
+    pendingTextAnalyses.set(requestId, {
+      resolve: (keys) => { finish(); resolve(new Set(keys)) },
+      reject: (error) => { finish(); reject(error) },
+    })
+    post({ type: 'analyze-text', requestId, svg, textNodes })
+  })
+}
+
 async function exportFrameAssets(
   frame: FrameNode,
   pageNumber: number,
@@ -257,15 +247,29 @@ async function exportFrameAssets(
     clone.x = frame.x + frame.width + 10_000
     detachInstances(clone)
 
-    const textNodes = clone.findAll((node) => isTextNode(node)).filter(isTextNode)
+    const textNodes = clone
+      .findAll((node) => isTextNode(node) && isEffectivelyVisible(node, clone!))
+      .filter(isTextNode)
     const textMeta: TextNodeMeta[] = []
+    const candidates = new Map<string, { node: SupportedTextNode; originalName: string }>()
     const warnings: ExportWarning[] = []
 
     textNodes.forEach((textNode, index) => {
+      const reason = textOutlineReason(textNode, clone!)
+      if (reason) {
+        warnings.push({
+          frameId: frame.id,
+          frameName: frame.name,
+          code: 'TEXT_OUTLINED_STYLE',
+          severity: 'warning',
+          message: `第 ${pageNumber} 页「${frame.name}」包含${reason}；将自动转曲保留外观，该部分不再作为可编辑文字。`,
+        })
+        return
+      }
       const key = `epdf_p${pageNumber}_t${index}`
+      candidates.set(key, { node: textNode, originalName: textNode.name })
       textNode.name = key
       textMeta.push(createTextNodeMeta(textNode, key, clone!))
-      warnings.push(...collectNodeWarnings(textNode, frame, pageNumber))
     })
 
     if (cancelled) throw new Error(EXPORT_CANCELLED)
@@ -273,22 +277,44 @@ async function exportFrameAssets(
       type: 'progress',
       progress: { pageNumber, totalPages, frameName: frame.name, phase: 'svg' },
     })
-    const svg = await clone.exportAsync({
-      format: 'SVG_STRING',
-      svgOutlineText: false,
-      svgIdAttribute: true,
-      svgSimplifyStroke: false,
-      useAbsoluteBounds: true,
-      contentsOnly: true,
-      colorProfile: 'SRGB',
-    })
+    let svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${frame.width} ${frame.height}"/>`
+    if (textMeta.length > 0) {
+      try {
+        svg = await clone.exportAsync({
+          format: 'SVG_STRING',
+          svgOutlineText: false,
+          svgIdAttribute: true,
+          svgSimplifyStroke: false,
+          useAbsoluteBounds: true,
+          contentsOnly: true,
+          colorProfile: 'SRGB',
+        })
+      } catch (error) {
+        // The native PDF can still preserve all text if SVG export fails.
+        console.warn('[Editable PDF Exporter] Falling back to native text', error)
+      }
+    }
 
     if (cancelled) throw new Error(EXPORT_CANCELLED)
-    // Keep Auto Layout geometry intact while removing visible text from the
-    // native background export. `visible = false` would collapse layout items.
-    textNodes.forEach((textNode) => {
-      textNode.opacity = 0
-    })
+    const editableKeys = await requestEditableTextKeys(svg, textMeta)
+    if (cancelled) throw new Error(EXPORT_CANCELLED)
+    // Only remove text that the UI can reconstruct. Everything else stays in
+    // Figma's native PDF as outlines, preserving strokes, masks and effects.
+    // Opacity keeps Auto Layout geometry intact; hiding nodes would reflow it.
+    for (const [key, { node, originalName }] of candidates) {
+      if (editableKeys.has(key)) {
+        node.opacity = 0
+      } else {
+        warnings.push({
+          frameId: frame.id,
+          frameName: frame.name,
+          nodeKey: key,
+          code: 'TEXT_OUTLINED_SVG',
+          severity: 'warning',
+          message: `第 ${pageNumber} 页「${frame.name}」的文字层「${originalName}」无法可靠重建，已自动转曲保留外观。`,
+        })
+      }
+    }
     post({
       type: 'progress',
       progress: { pageNumber, totalPages, frameName: frame.name, phase: 'background' },
@@ -311,7 +337,7 @@ async function exportFrameAssets(
       pageNumber,
       svg,
       backgroundPdf,
-      textNodes: textMeta,
+      textNodes: textMeta.filter((meta) => editableKeys.has(meta.key)),
       warnings: dedupeWarnings(warnings),
     }
   } finally {
@@ -342,15 +368,20 @@ function postUserError(error: unknown, requestId?: number): void {
 }
 
 async function handleMessage(message: UiToPluginMessage): Promise<void> {
+  if (message.type === 'text-analysis') {
+    pendingTextAnalyses.get(message.requestId)?.resolve(message.editableTextKeys)
+    return
+  }
   if (message.type === 'resize') {
     figma.ui.resize(
       Math.max(380, Math.min(500, message.width)),
-      Math.max(260, Math.min(600, message.height)),
+      Math.max(180, Math.min(600, message.height)),
     )
     return
   }
   if (message.type === 'cancel') {
     cancelled = true
+    cancelTextAnalyses()
     return
   }
   if (message.type === 'ready' || message.type === 'rescan') {
@@ -383,10 +414,12 @@ figma.ui.onmessage = (message: UiToPluginMessage) => {
 
 figma.on('currentpagechange', () => {
   cancelled = true
+  cancelTextAnalyses()
   void publishCurrentScan(undefined, false).catch((error: unknown) => postUserError(error))
 })
 
 figma.on('close', () => {
   cancelled = true
+  cancelTextAnalyses()
   removeAllTemporaryNodes()
 })
