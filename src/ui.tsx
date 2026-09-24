@@ -82,26 +82,16 @@ function App() {
   useEffect(() => {
     const app = appRef.current
     if (!app) return
-    let frame = 0
-    let lastHeight = 0
-    const resize = () => {
-      cancelAnimationFrame(frame)
-      frame = requestAnimationFrame(() => {
-        const height = Math.max(180, Math.min(600, Math.ceil(app.scrollHeight)))
-        if (Math.abs(height - lastHeight) < 2) return
-        lastHeight = height
-        send({ type: 'resize', width: 420, height })
-      })
-    }
-    const observer = typeof ResizeObserver === 'undefined' ? null : new ResizeObserver(resize)
-    observer?.observe(app)
-    window.addEventListener('resize', resize)
-    resize()
-    return () => {
-      cancelAnimationFrame(frame)
-      observer?.disconnect()
-      window.removeEventListener('resize', resize)
-    }
+    // Measure the expanded height without painting it, then keep the window steady.
+    const frame = requestAnimationFrame(() => {
+      const instructions = app.querySelector<HTMLDetailsElement>('.instructions-panel')
+      const wasOpen = instructions?.open ?? false
+      if (instructions) instructions.open = true
+      const height = Math.max(180, Math.min(600, Math.ceil(app.scrollHeight)))
+      if (instructions) instructions.open = wasOpen
+      send({ type: 'resize', width: 420, height })
+    })
+    return () => cancelAnimationFrame(frame)
   }, [])
 
   useEffect(() => {
@@ -276,29 +266,32 @@ function App() {
 
   return (
     <main ref={appRef} className="app-shell">
-      <header className="page-header">
-        <div className="page-copy">
-          <span className="muted-label">当前页面</span>
-          <strong title={scan?.pageName}>{scan?.pageName ?? '读取中…'}</strong>
-          <span className="muted-label">{scan ? `${scan.frames.length} 个画板 · ${scan.fonts.length} 种字体样式` : '正在扫描…'}</span>
-        </div>
-        <button className="ghost-button" type="button" title="重新读取当前页面" disabled={exporting || scanning} onClick={rescan}>
+      <section className="export-card" aria-labelledby="page-title">
+        <p className="scan-status" role="status">
+          {scanning || status === '正在刷新当前页面…' ? status : ''}
+        </p>
+        <button className="refresh-button" type="button" title={scanning ? '正在读取当前页面' : '刷新当前页面'} aria-label="刷新当前页面" disabled={exporting || scanning} onClick={rescan}>
           <Icon name="refresh" />
-          {scanning ? '读取中' : '刷新'}
         </button>
-      </header>
-
-      {scan && scan.warnings.length > 0 && (
-        <section className="warning-panel" aria-labelledby="warning-title">
-          <div className="section-title"><h2 id="warning-title">导出前检查</h2><span className="muted-label">{scan.warnings.length} 项提示</span></div>
-          <ul>
-            {scan.warnings.slice(0, 8).map((warning, index) => (
-              <li className={warning.severity} key={`${warning.code}-${index}`}>{warning.message}</li>
-            ))}
-          </ul>
-          {scan.warnings.length > 8 && <small>其余 {scan.warnings.length - 8} 项可在交接包报告中查看。</small>}
-        </section>
-      )}
+        <header className="page-header">
+          <h1 id="page-title" title={scan?.pageName}>{scan?.pageName ?? '读取中…'}</h1>
+          <p className="muted-label">{scan ? `${scan.frames.length} 个画板 · ${scan.fonts.length} 种字体样式` : '正在扫描…'}</p>
+        </header>
+        <div className="export-actions">
+          {exporting ? (
+            <button className="danger-button" type="button" onClick={cancelExport}>取消导出</button>
+          ) : (
+            <>
+              <button className="primary-button" type="button" disabled={!canExport} onClick={() => void startExport('pdf')}>
+                <Icon name="download" />
+                导出 PDF
+              </button>
+              <button className="secondary-button" type="button" title="包含 PDF、字体清单和跨电脑编辑说明" disabled={!canExport} onClick={() => void startExport('zip')}>
+                交接包
+              </button>
+            </>
+          )}
+        </div>
 
       {exporting && (
         <section className="progress-section">
@@ -317,28 +310,20 @@ function App() {
         </div>
       )}
 
-      <footer className="export-footer">
-        <p className="status-text" role="status">{status}</p>
-        {exporting ? (
-          <button className="danger-button" type="button" onClick={cancelExport}>取消导出</button>
-        ) : (
-          <div className="export-actions">
-            <button
-              className="secondary-button"
-              type="button"
-              title="包含 PDF、字体清单和跨电脑编辑说明"
-              disabled={!canExport}
-              onClick={() => void startExport('zip')}
-            >
-              交接包
-            </button>
-            <button className="primary-button" type="button" disabled={!canExport} onClick={() => void startExport('pdf')}>
-              <Icon name="download" />
-              导出 PDF
-            </button>
-          </div>
-        )}
-      </footer>
+        <p className="status-text" role="status">
+          {scanning || status === '正在刷新当前页面…' || status === '已准备好，可以直接导出。' ? '' : status}
+        </p>
+      </section>
+
+      <details className="instructions-panel">
+        <summary>导出说明</summary>
+        <ul>
+          <li>导出当前页面的顶层画板，每个画板对应一页 PDF。</li>
+          <li>普通文字保持可编辑；特殊样式或无法可靠重建的文字会自动转曲，保留外观。原 Figma 文件不受影响。</li>
+          <li>未嵌入的字体需在接收电脑安装；跨电脑编辑时，已嵌入的字体也可能需要安装同版本字体。</li>
+          <li>交接包包含 PDF、字体清单、兼容性提示和编辑说明，不包含字体原文件。</li>
+        </ul>
+      </details>
     </main>
   )
 }
